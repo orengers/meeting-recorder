@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>מקליט פגישות</title>
+<style>
+  :root{--bg:#f7f7f5;--card:#fff;--fg:#1d1d1f;--muted:#6b6b70;--accent:#c0392b;--line:#e3e3e0}
+  @media (prefers-color-scheme:dark){:root{--bg:#161618;--card:#202023;--fg:#ececec;--muted:#9a9aa0;--accent:#e5534b;--line:#333}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,"Segoe UI",Arial,sans-serif}
+  main{max-width:820px;margin:0 auto;padding:24px 16px}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:var(--muted);margin:0 0 20px;font-size:14px}
+  .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:16px}
+  button{font:inherit;padding:10px 16px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button:disabled{opacity:.45;cursor:default}
+  .status{margin-inline-start:auto;font-size:14px;color:var(--muted);display:flex;align-items:center;gap:8px}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--muted)}
+  .rec .dot{background:var(--accent);animation:p 1.2s infinite}
+  @keyframes p{50%{opacity:.3}}
+  #log{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;min-height:300px;max-height:60vh;overflow:auto}
+  .seg{margin:0 0 8px}
+  .t{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;margin-inline-end:8px}
+  #interim{color:var(--muted);font-style:italic}
+  .note{font-size:13px;color:var(--muted);margin-top:14px}
+  .err{color:var(--accent)}
+  #meter{width:80px;height:6px;border-radius:3px;background:var(--line);overflow:hidden}
+  #lvl{height:100%;width:0;background:var(--accent);transition:width .1s}
+</style>
+</head>
+<body>
+<main>
+  <h1>מקליט פגישות</h1>
+  <p class="sub">הקלטת שמע ותמלול חי בעברית. בסוף הפגישה: "שמור שמע" ו"שמור תמלול", ואז תגיד ל-Claude שסיימת.</p>
+  <div class="bar" id="bar">
+    <button class="primary" id="start">● התחל הקלטה</button>
+    <button id="pause" disabled>השהה</button>
+    <button id="saveAudio">שמור שמע</button>
+    <button id="save">שמור תמלול</button>
+    <button id="share" hidden>שתף</button>
+    <button id="copy">העתק</button>
+    <button id="clear">נקה</button>
+    <span class="status"><div id="meter"><div id="lvl"></div></div><span class="dot"></span><span id="st">מוכן</span> · <span id="clock">00:00:00</span> · <span id="asize">שמע: 0MB</span></span>
+  </div>
+  <div id="log"><div id="segs"></div><div id="interim"></div></div>
+  <p class="note" id="note">השאר את הדף פתוח וגלוי בזמן הפגישה. השמע והתמלול נשמרים אוטומטית בדפדפן גם אם הדף נסגר בטעות.</p>
+</main>
+<script>
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const $ = id => document.getElementById(id);
+// On phones the live speech recognition and a parallel audio recorder fight over the mic, so phones get transcript only.
+const MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+let wake = null;
+async function keepAwake(on){ try { if (on && 'wakeLock' in navigator && !wake) { wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', () => wake = null); }
+  else if (!on && wake) { await wake.release(); wake = null; } } catch(e){} }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && running) keepAwake(true); });
+const KEY = 'meeting-transcript-v1';
+let segs = [], running = false, rec = null, t0 = null, elapsed = 0, timer = null;
+let stream = null, mr = null, session = null, audioBytes = 0, actx = null, raf = null;
+
+/* ---------- IndexedDB for audio chunks ---------- */
+const dbp = new Promise((res, rej) => { const r = indexedDB.open('meeting-audio', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('chunks', {autoIncrement: true});
+  r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+async function idb(mode, fn){ const db = await dbp; return new Promise((res, rej) => {
+  const tx = db.transaction('chunks', mode); const out = fn(tx.objectStore('chunks'));
+  tx.oncomplete = () => res(out && out.result); tx.onerror = () => rej(tx.error); }); }
+const idbAdd = rec => idb('readwrite', s => s.add(rec));
+const idbAll = () => idb('readonly', s => s.getAll());
+const idbClear = () => idb('readwrite', s => s.clear());
+idbAll().then(all => { audioBytes = all.reduce((n, c) => n + c.blob.size, 0); showSize(); }).catch(()=>{});
+function showSize(){ $('asize').textContent = 'שמע: ' + (audioBytes/1048576).toFixed(1) + 'MB'; }
+
+/* ---------- transcript state ---------- */
+try { const s = JSON.parse(localStorage.getItem(KEY) || 'null'); if (s) { segs = s.segs || []; elapsed = s.elapsed || 0; } } catch(e){}
+function persist(){ try { localStorage.setItem(KEY, JSON.stringify({segs, elapsed: now()})); } catch(e){} }
+function now(){ return elapsed + (t0 ? Date.now() - t0 : 0); }
+function fmt(ms){ const s = Math.floor(ms/1000); return [s/3600, (s%3600)/60, s%60].map(n => String(Math.floor(n)).padStart(2,'0')).join(':'); }
+function render(){
+  $('segs').innerHTML = '';
+  for (const g of segs) { const p = document.createElement('p'); p.className='seg';
+    const t = document.createElement('span'); t.className='t'; t.textContent = fmt(g.at);
+    p.append(t, document.createTextNode(g.text)); $('segs').append(p); }
+  $('log').scrollTop = $('log').scrollHeight;
+}
+function setState(r, label){ running = r; $('bar').classList.toggle('rec', r); $('st').textContent = label;
+  $('start').disabled = r; $('pause').disabled = !r; }
+function warn(msg){ $('note').innerHTML = '<span class="err"></span>'; $('note').firstChild.textContent = msg; }
+
+if (!SR) warn('הדפדפן לא תומך בתמלול חי (ההקלטה תעבוד). לתמלול חי פתח ב-Google Chrome.');
+
+/* ---------- speech recognition ---------- */
+function makeRec(){
+  const r = new SR(); r.lang = 'he-IL'; r.continuous = true; r.interimResults = true;
+  r.onresult = e => { let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) { const res = e.results[i];
+      if (res.isFinal) { const txt = res[0].transcript.trim(); if (txt) { segs.push({at: now(), text: txt}); persist(); render(); } }
+      else interim += res[0].transcript; }
+    $('interim').textContent = interim; };
+  r.onerror = e => { if (e.error === 'not-allowed' || e.error === 'service-not-allowed') warn('התמלול החי נחסם, אבל הקלטת השמע ממשיכה.'); };
+  r.onend = () => { if (running && rec === r) { try { r.start(); } catch(e){ setTimeout(()=>{ if (running) { rec = makeRec(); try { rec.start(); } catch(_){} } }, 300); } } };
+  return r;
+}
+
+/* ---------- audio recording ---------- */
+async function startAudio(){
+  if (mr && mr.state === 'paused') { mr.resume(); return; }
+  stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, channelCount: 1}});
+  const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : '';
+  mr = new MediaRecorder(stream, mime ? {mimeType: mime, audioBitsPerSecond: 64000} : undefined);
+  session = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+  mr.ondataavailable = e => { if (e.data && e.data.size) { audioBytes += e.data.size; showSize();
+    idbAdd({session, type: mr ? mr.mimeType : 'audio/webm', blob: e.data}).catch(()=> warn('שגיאה בשמירת השמע בדפדפן. לחץ "שמור שמע" עכשיו.')); } };
+  mr.start(5000);
+  actx = new AudioContext(); const an = actx.createAnalyser(); an.fftSize = 512;
+  actx.createMediaStreamSource(stream).connect(an); const buf = new Uint8Array(an.fftSize);
+  const tick = () => { an.getByteTimeDomainData(buf); let m = 0; for (const v of buf) m = Math.max(m, Math.abs(v-128));
+    $('lvl').style.width = (running ? Math.min(100, m*1.6) : 0) + '%'; raf = requestAnimationFrame(tick); }; tick();
+}
+function endAudio(){ return new Promise(res => { if (!mr || mr.state === 'inactive') return res();
+  mr.onstop = () => setTimeout(res, 300); mr.stop(); stream.getTracks().forEach(t => t.stop());
+  cancelAnimationFrame(raf); if (actx) actx.close(); $('lvl').style.width = '0'; mr = null; stream = null; }); }
+
+/* ---------- controls ---------- */
+async function start(){
+  if (!MOBILE) { try { await startAudio(); } catch(e) { warn('אין גישה למיקרופון. אשר גישה למיקרופון בסרגל הכתובת ונסה שוב.'); return; } }
+  else if (!SR) return;
+  keepAwake(true);
+  if (SR) { rec = makeRec(); try { rec.start(); } catch(e){} }
+  t0 = Date.now(); setState(true, 'מקליט');
+  timer = setInterval(()=> $('clock').textContent = fmt(now()), 500);
+}
+function pause(label){ if (t0) { elapsed += Date.now() - t0; t0 = null; } clearInterval(timer); setState(false, label || 'מושהה'); keepAwake(false);
+  if (rec) { const r = rec; rec = null; try { r.stop(); } catch(e){} } $('interim').textContent='';
+  if (mr && mr.state === 'recording') { mr.pause(); mr.requestData(); } persist(); }
+
+function text(){ return 'תמלול פגישה – ' + new Date().toLocaleString('he-IL') + '\n\n' + segs.map(g => '[' + fmt(g.at) + '] ' + g.text).join('\n'); }
+function download(blob, name){ const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(()=> URL.revokeObjectURL(a.href), 60000); }
+
+$('start').onclick = start;
+$('pause').onclick = () => pause();
+$('saveAudio').onclick = async () => {
+  if (running) pause();
+  await endAudio();                       // closes the file cleanly; "התחל" afterwards starts a new file
+  const all = await idbAll(); if (!all.length) { $('st').textContent = 'אין שמע'; return; }
+  const groups = {}; for (const c of all) (groups[c.session] ||= {type: c.type, parts: []}).parts.push(c.blob);
+  for (const [s, g] of Object.entries(groups)) download(new Blob(g.parts, {type: g.type.split(';')[0]}), 'הקלטת-פגישה-' + s + '.webm');
+  $('st').textContent = 'השמע נשמר';
+};
+$('save').onclick = () => download(new Blob(['﻿' + text()], {type:'text/plain;charset=utf-8'}),
+  'תמלול-פגישה-' + new Date().toISOString().slice(0,16).replace(/[:T]/g,'-') + '.txt');
+$('copy').onclick = async () => { try { await navigator.clipboard.writeText(text()); $('st').textContent = 'הועתק'; } catch(e){} };
+$('clear').onclick = async () => { if (!confirm('למחוק את כל התמלול וההקלטה? לא ניתן לשחזר.')) return;
+  pause('מוכן'); await endAudio(); await idbClear(); audioBytes = 0; showSize();
+  segs = []; elapsed = 0; persist(); render(); $('clock').textContent = '00:00:00'; };
+window.addEventListener('beforeunload', e => { if (running) { e.preventDefault(); e.returnValue = ''; } });
+if (MOBILE) {
+  $('saveAudio').hidden = true; $('asize').hidden = true; $('meter').hidden = true;
+  if (navigator.share) $('share').hidden = false;
+  $('note').textContent = 'בטלפון: השאר את המסך דולק ואת Chrome פתוח על הדף הזה בזמן הפגישה. בסוף לחץ "שתף" ושלח את התמלול לעצמך (Gmail או Drive), או "העתק".';
+}
+$('share').onclick = async () => { try { await navigator.share({title: 'תמלול פגישה', text: text()}); } catch(e){} };
+$('clock').textContent = fmt(elapsed); render();
+</script>
+</body>
+</html>
